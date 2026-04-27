@@ -1,4 +1,4 @@
-# 🚗 Automotive Graph RAG System — BMW Edition
+# 🚗 Automotive Graph RAG System
 
 > **Graph-enhanced Retrieval-Augmented Generation** for the automotive industry  
 > Powered by **Neo4j + ChromaDB + LangGraph + Ollama** — 100% free & open-source, runs locally.
