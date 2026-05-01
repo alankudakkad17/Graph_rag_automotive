@@ -106,8 +106,6 @@ python -m spacy download en_core_web_sm
 ### 5. Ingest the BMW PDF
 
 ```bash
-# Copy your PDF to the data folder
-copy "C:\Users\91956\Downloads\2023-bmw-7-30-62.pdf" data\pdfs\
 
 # Run ingestion
 python -c "
