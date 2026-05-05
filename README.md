@@ -48,7 +48,7 @@
 | **LLM** | [Ollama](https://ollama.com) — `llama3`, `mistral`, `gemma2` |
 | **Embeddings** | `sentence-transformers/all-MiniLM-L6-v2` (local) |
 | **Reranker** | `cross-encoder/ms-marco-MiniLM-L-6-v2` (local) |
-| **Graph DB** | Neo4j 5 Community Edition (Docker) |
+| **Graph DB** | Neo4j 5 (Docker) |
 | **Vector DB** | ChromaDB (persistent local) |
 | **Agent Framework** | LangGraph |
 | **Backend** | FastAPI + Uvicorn |
