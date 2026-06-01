@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend.api.routes import query, ingest, graph
+from backend.api.routes import query, ingest, graph, stream
 from backend.graph.neo4j_client import bootstrap_schema, close_driver
 from backend.config import get_settings
 from backend.utils import logger
@@ -75,6 +75,7 @@ def create_app() -> FastAPI:
     app.include_router(query.router)
     app.include_router(ingest.router)
     app.include_router(graph.router)
+    app.include_router(stream.router)      # ← streaming SSE
 
     # ── Health check ──────────────────────────────────────────────────────────
     @app.get("/health", tags=["System"])

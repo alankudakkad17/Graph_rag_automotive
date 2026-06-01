@@ -1,2 +1,2 @@
-from . import query, ingest, graph
-__all__ = ["query", "ingest", "graph"]
+from . import query, ingest, graph, stream
+__all__ = ["query", "ingest", "graph", "stream"]

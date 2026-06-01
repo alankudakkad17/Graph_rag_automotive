@@ -25,6 +25,8 @@ class QueryResponse(BaseModel):
     confidence: float
     query_intent: str
     num_results: int
+    was_refused: bool = False          # ← NEW
+    refusal_reason: str = ""           # ← NEW
     error: Optional[str] = None
 
 

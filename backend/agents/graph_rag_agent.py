@@ -9,12 +9,16 @@ Graph nodes (agent steps):
   3. select_pipeline     → choose VECTOR / GRAPH / HYBRID dynamically
   4. retrieve            → fetch from Neo4j + ChromaDB
   5. rerank              → cross-encoder reranking
-  6. optimize_prompt     → build context-aware system prompt
-  7. generate            → Ollama LLM generates answer
-  8. validate            → hallucination / relevance guard
+  6. check_relevance     → relevance gate — refuse if docs not relevant
+  7. optimize_prompt     → build context-aware system prompt
+  8. generate            → Ollama LLM generates answer
+  9. validate            → numeric grounding check
+  10. refuse_answer      → clean refusal when relevance gate fails
 
-State flows:  START → classify → expand → select → retrieve → rerank
-                    → optimize → generate → validate → END
+State flows:
+  START → classify → expand → select → retrieve → rerank
+        → check_relevance ──► [relevant]   → optimize → generate → validate → END
+                          └─► [irrelevant] → refuse → END
 """
 from __future__ import annotations
 
@@ -49,6 +53,10 @@ class AgentState(TypedDict):
     pipeline: str               # vector_only | graph_only | hybrid
     raw_results: list[dict]
     reranked_results: list[dict]
+
+    # Relevance gate  ← NEW
+    should_generate: bool       # True = proceed to generation, False = refuse
+    refusal_reason: str         # no_results | low_score | llm_irrelevant
 
     # Generation
     system_prompt: str
@@ -247,7 +255,134 @@ def rerank_results(state: AgentState) -> AgentState:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Node 6 — Prompt Optimization
+#  Node 6 — Relevance Gate  (pre-generation guard)
+# ══════════════════════════════════════════════════════════════════════════════
+def check_relevance(state: AgentState) -> AgentState:
+    """
+    Decides whether retrieved documents are relevant enough to answer
+    the query before the LLM is invoked.
+
+    Three score zones:
+      0.0 – 0.3  → REFUSE immediately   (cross-encoder confident: irrelevant)
+      0.3 – 0.6  → LLM decides          (borderline: need semantic judgement)
+      0.6 – 1.0  → PROCEED              (cross-encoder confident: relevant)
+    """
+    import re
+    results = state.get("reranked_results", [])
+    query   = state["original_query"]
+
+    # ── No results at all ────────────────────────────────────────────────────
+    if not results:
+        logger.info("  [RelevanceGate] No results → refusing")
+        state["should_generate"] = False
+        state["refusal_reason"]  = "no_results"
+        return state
+
+    top_score = results[0]["score"]
+    logger.info(f"  [RelevanceGate] top_score={top_score:.4f}")
+
+    # ── Score too low — refuse without LLM call ───────────────────────────
+    if top_score < 0.3:
+        logger.info("  [RelevanceGate] Score < 0.3 → refusing (low_score)")
+        state["should_generate"] = False
+        state["refusal_reason"]  = "low_score"
+        return state
+
+    # ── Score is high — proceed without LLM call ─────────────────────────
+    if top_score >= 0.6:
+        logger.info("  [RelevanceGate] Score ≥ 0.6 → proceeding")
+        state["should_generate"] = True
+        state["refusal_reason"]  = ""
+        return state
+
+    # ── Borderline (0.3 – 0.6) — ask LLM to judge ────────────────────────
+    logger.info("  [RelevanceGate] Borderline score → asking LLM")
+    relevant = _llm_relevance_check(query, results[:3])
+    state["should_generate"] = relevant
+    state["refusal_reason"]  = "" if relevant else "llm_irrelevant"
+    logger.info(f"  [RelevanceGate] LLM decision → {'proceed' if relevant else 'refuse'}")
+    return state
+
+
+def _llm_relevance_check(query: str, results: list[dict]) -> bool:
+    """
+    Lightweight LLM call: can these documents answer this question?
+    Uses temperature=0.0 for deterministic YES/NO output.
+    Fails open (returns True) if LLM call errors — avoids silent data loss.
+    """
+    context_preview = "\n".join(
+        f"Document {i+1}: {r['text'][:200]}"
+        for i, r in enumerate(results)
+    )
+    llm = _get_llm(temperature=0.0)
+    prompt = f"""You are evaluating whether retrieved documents can answer a user question about BMW vehicles.
+
+Question: "{query}"
+
+Retrieved documents:
+{context_preview}
+
+Can these documents provide a direct and accurate answer to the question?
+Respond with ONLY one word: YES or NO"""
+
+    try:
+        response = llm.invoke(prompt).strip().upper()
+        return response.startswith("YES")
+    except Exception as exc:
+        logger.warning(f"  [RelevanceGate] LLM check failed: {exc} — failing open")
+        return True   # fail open: prefer generating over silent refusal
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Node 6b — Refuse Answer  (called when relevance gate fails)
+# ══════════════════════════════════════════════════════════════════════════════
+def refuse_answer(state: AgentState) -> AgentState:
+    """
+    Returns a clean, informative refusal message instead of a
+    hallucinated or uncertain answer.
+    Message is personalised to the specific reason for refusal.
+    """
+    reason = state.get("refusal_reason", "unknown")
+    query  = state["original_query"]
+
+    refusal_messages = {
+        "no_results": (
+            f"I could not find any information related to **\"{query}\"** "
+            f"in the BMW 7 Series knowledge base.\n\n"
+            f"**Suggestions:**\n"
+            f"- Try rephrasing your question with different keywords\n"
+            f"- Upload additional BMW documentation via the Upload tab\n"
+            f"- Check that the ingestion pipeline completed successfully"
+        ),
+        "low_score": (
+            f"The documents retrieved for **\"{query}\"** do not appear "
+            f"relevant enough to provide a reliable answer.\n\n"
+            f"The information may not be present in the current knowledge base. "
+            f"I will not guess — please consult official BMW documentation "
+            f"or upload a more specific document."
+        ),
+        "llm_irrelevant": (
+            f"After reviewing the retrieved documents, they do not contain "
+            f"sufficient information to accurately answer **\"{query}\"**.\n\n"
+            f"I will not generate an answer from unrelated context as it would "
+            f"risk providing incorrect information. Please try a more specific "
+            f"question or upload relevant BMW documentation."
+        ),
+    }
+
+    state["answer"]     = refusal_messages.get(
+        reason,
+        f"Unable to answer \"{query}\" — insufficient relevant information found."
+    )
+    state["confidence"] = 0.0
+    state["sources"]    = []
+    state["context"]    = ""
+    logger.info(f"  [RefuseAnswer] Refused with reason: {reason}")
+    return state
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Node 7 — Prompt Optimization
 # ══════════════════════════════════════════════════════════════════════════════
 def optimize_prompt(state: AgentState) -> AgentState:
     """
@@ -313,7 +448,7 @@ Context from Knowledge Base:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Node 7 — Answer Generation
+#  Node 8 — Answer Generation
 # ══════════════════════════════════════════════════════════════════════════════
 def generate_answer(state: AgentState) -> AgentState:
     """Generate final answer using Ollama LLM."""
@@ -348,13 +483,14 @@ def generate_answer(state: AgentState) -> AgentState:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Node 8 — Validation (Hallucination Guard)
+#  Node 9 — Validation (Numeric Grounding Check)
 # ══════════════════════════════════════════════════════════════════════════════
 def validate_answer(state: AgentState) -> AgentState:
     """
-    Light hallucination guard:
-    - If context was empty, prepend a disclaimer.
-    - If answer contains numbers not in context, flag it.
+    Final numeric grounding check on the generated answer.
+    The relevance gate (Node 6) already blocked irrelevant-context generation,
+    so this focuses only on catching numbers the LLM may have fabricated
+    despite having relevant context.
     """
     answer = state.get("answer", "")
     context = state.get("context", "")
@@ -384,29 +520,53 @@ def validate_answer(state: AgentState) -> AgentState:
 # ══════════════════════════════════════════════════════════════════════════════
 #  Build LangGraph
 # ══════════════════════════════════════════════════════════════════════════════
+def _route_relevance(state: AgentState) -> str:
+    """Conditional edge router after check_relevance node."""
+    return "generate" if state.get("should_generate", False) else "refuse"
+
+
 def build_agent() -> StateGraph:
     graph = StateGraph(AgentState)
 
-    # Add nodes
+    # ── Register all nodes ────────────────────────────────────────────────────
     graph.add_node("classify_query",  classify_query)
     graph.add_node("expand_query",    expand_query)
     graph.add_node("select_pipeline", select_pipeline)
     graph.add_node("retrieve",        retrieve)
     graph.add_node("rerank",          rerank_results)
+    graph.add_node("check_relevance", check_relevance)   # ← NEW
+    graph.add_node("refuse",          refuse_answer)     # ← NEW
     graph.add_node("optimize_prompt", optimize_prompt)
     graph.add_node("generate",        generate_answer)
     graph.add_node("validate",        validate_answer)
 
-    # Define edges
-    graph.add_edge(START,            "classify_query")
-    graph.add_edge("classify_query", "expand_query")
-    graph.add_edge("expand_query",   "select_pipeline")
-    graph.add_edge("select_pipeline","retrieve")
-    graph.add_edge("retrieve",       "rerank")
-    graph.add_edge("rerank",         "optimize_prompt")
-    graph.add_edge("optimize_prompt","generate")
-    graph.add_edge("generate",       "validate")
-    graph.add_edge("validate",       END)
+    # ── Linear edges ──────────────────────────────────────────────────────────
+    graph.add_edge(START,              "classify_query")
+    graph.add_edge("classify_query",   "expand_query")
+    graph.add_edge("expand_query",     "select_pipeline")
+    graph.add_edge("select_pipeline",  "retrieve")
+    graph.add_edge("retrieve",         "rerank")
+    graph.add_edge("rerank",           "check_relevance")  # ← NEW
+
+    # ── Conditional edge — relevance gate branches here ───────────────────────
+    #   relevant   → optimize_prompt → generate → validate → END
+    #   irrelevant → refuse → END
+    graph.add_conditional_edges(
+        "check_relevance",
+        _route_relevance,
+        {
+            "generate": "optimize_prompt",
+            "refuse":   "refuse",
+        },
+    )
+
+    # ── Generation path ───────────────────────────────────────────────────────
+    graph.add_edge("optimize_prompt", "generate")
+    graph.add_edge("generate",        "validate")
+    graph.add_edge("validate",        END)
+
+    # ── Refusal path ──────────────────────────────────────────────────────────
+    graph.add_edge("refuse",          END)
 
     return graph.compile()
 
@@ -434,30 +594,34 @@ def run_agent(
     """
     agent = get_agent()
     initial_state: AgentState = {
-        "original_query": query,
-        "chat_history": chat_history or [],
-        "query_intent": "",
-        "query_complexity": "",
-        "expanded_queries": [],
-        "pipeline": "hybrid",
-        "raw_results": [],
-        "reranked_results": [],
-        "system_prompt": "",
-        "context": "",
-        "answer": "",
-        "sources": [],
-        "confidence": 0.0,
+        "original_query":  query,
+        "chat_history":    chat_history or [],
+        "query_intent":    "",
+        "query_complexity":"",
+        "expanded_queries":[],
+        "pipeline":        "hybrid",
+        "raw_results":     [],
+        "reranked_results":[],
+        "should_generate": True,    # ← NEW
+        "refusal_reason":  "",      # ← NEW
+        "system_prompt":   "",
+        "context":         "",
+        "answer":          "",
+        "sources":         [],
+        "confidence":      0.0,
         "pipeline_reason": "",
-        "error": None,
+        "error":           None,
     }
     final_state = agent.invoke(initial_state)
     return {
-        "answer":          final_state["answer"],
-        "sources":         final_state["sources"],
-        "pipeline":        final_state["pipeline"],
-        "confidence":      final_state["confidence"],
-        "pipeline_reason": final_state["pipeline_reason"],
-        "query_intent":    final_state["query_intent"],
-        "num_results":     len(final_state["reranked_results"]),
-        "error":           final_state.get("error"),
+        "answer":           final_state["answer"],
+        "sources":          final_state["sources"],
+        "pipeline":         final_state["pipeline"],
+        "confidence":       final_state["confidence"],
+        "pipeline_reason":  final_state["pipeline_reason"],
+        "query_intent":     final_state["query_intent"],
+        "num_results":      len(final_state["reranked_results"]),
+        "was_refused":      not final_state.get("should_generate", True),  # ← NEW
+        "refusal_reason":   final_state.get("refusal_reason", ""),         # ← NEW
+        "error":            final_state.get("error"),
     }

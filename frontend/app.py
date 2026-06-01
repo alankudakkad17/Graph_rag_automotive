@@ -2,11 +2,13 @@
 app.py — Gradio Frontend for the Automotive Graph RAG System
 ─────────────────────────────────────────────────────────────
 Tabs:
-  🚗 Chat          — Conversational Q&A with pipeline selector & source display
+  🚗 Chat          — Streaming conversational Q&A with pipeline selector
   📄 Ingest        — PDF upload + batch scan trigger
   🕸  Graph View   — Interactive Neo4j graph visualization (Plotly)
   📊 Stats         — System health & index statistics
   💡 Examples      — Quick-start sample queries for the BMW 7 Series
+
+Evaluation is a separate offline test script — run: python evaluate.py
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from pathlib import Path
 import gradio as gr
 import plotly.graph_objects as go
 import plotly.express as px
+import httpx
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -59,17 +62,23 @@ EXAMPLE_QUERIES = [
 ]
 
 
-# ── Chat Logic ────────────────────────────────────────────────────────────────
-def chat_respond(
+# ── Streaming Chat Logic ──────────────────────────────────────────────────────
+FASTAPI_BASE = os.getenv("FASTAPI_BASE_URL", "http://localhost:8000")
+
+
+def chat_stream(
     message: str,
     history: list[list[str]],
     pipeline: str,
-) -> tuple[str, list[list[str]], str]:
+):
     """
-    Returns: (cleared input, updated history, metadata string)
+    Streaming chat handler — connects to /stream/query SSE endpoint.
+    Yields (history, metadata) tuples as tokens arrive so Gradio
+    renders them word-by-word in real time.
     """
     if not message.strip():
-        return "", history, ""
+        yield history, ""
+        return
 
     # Convert Gradio history to API format
     api_history = []
@@ -79,41 +88,97 @@ def chat_respond(
         if h[1]:
             api_history.append({"role": "assistant","content": h[1]})
 
+    # Append user message with empty assistant slot
+    history = history + [[message, ""]]
+    meta = "*Connecting to pipeline…*"
+    yield history, meta
+
+    accumulated  = ""
+    stage_lines  = []
+    final_meta   = ""
+
     try:
-        result = api_query(message, api_history, pipeline)
-        answer = result.get("answer", "No answer returned.")
-        sources = result.get("sources", [])
-        pipe_used = result.get("pipeline", pipeline)
-        confidence = result.get("confidence", 0.0)
-        intent = result.get("query_intent", "")
-        pipe_reason = result.get("pipeline_reason", "")
-        n_results = result.get("num_results", 0)
+        with httpx.Client(timeout=120.0) as client:
+            with client.stream(
+                "POST",
+                f"{FASTAPI_BASE}/stream/query",
+                json={"query": message, "chat_history": api_history},
+                headers={"Accept": "text/event-stream"},
+            ) as resp:
+                for line in resp.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[len("data:"):].strip()
+                    if not raw:
+                        continue
 
-        # Append sources to answer
-        if sources:
-            src_text = "\n\n📎 **Sources:** " + " | ".join(
-                f"`{s}`" for s in sources[:5]
-            )
-            answer += src_text
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
 
-        # Metadata panel
-        meta = (
-            f"**Pipeline:** `{pipe_used}` — {pipe_reason}\n"
-            f"**Intent:** `{intent}` | "
-            f"**Confidence:** `{confidence:.2%}` | "
-            f"**Results used:** `{n_results}`"
-        )
+                    etype   = event.get("type", "")
+                    content = event.get("content", "")
 
+                    if etype == "stage":
+                        stage_lines.append(content)
+                        meta = "\n".join(stage_lines[-4:])   # show last 4 stages
+                        yield history, meta
+
+                    elif etype == "token":
+                        accumulated += content
+                        history[-1][1] = accumulated
+                        yield history, meta
+
+                    elif etype == "metadata":
+                        pipe_used   = content.get("pipeline", "")
+                        pipe_reason = content.get("pipeline_reason", "")
+                        confidence  = content.get("confidence", 0.0)
+                        intent      = content.get("query_intent", "")
+                        n_results   = content.get("num_results", 0)
+                        sources     = content.get("sources", [])
+
+                        src_text = ""
+                        if sources:
+                            src_text = "\n\n📎 **Sources:** " + " | ".join(
+                                f"`{s}`" for s in sources[:5]
+                            )
+                        history[-1][1] = accumulated + src_text
+
+                        final_meta = (
+                            f"**Pipeline:** `{pipe_used}` — {pipe_reason}\n"
+                            f"**Intent:** `{intent}` | "
+                            f"**Confidence:** `{confidence:.2%}` | "
+                            f"**Results used:** `{n_results}`"
+                        )
+                        yield history, final_meta
+
+                    elif etype == "refused":
+                        history[-1][1] = content
+                        final_meta = "⚠️ Query refused by relevance gate"
+                        yield history, final_meta
+
+                    elif etype == "error":
+                        history[-1][1] = f"❌ **Error:** {content}"
+                        yield history, f"Error: {content}"
+
+                    elif etype == "done":
+                        yield history, final_meta or meta
+                        return
+
+    except httpx.ConnectError:
+        history[-1][1] = "❌ **Cannot connect to FastAPI backend.**\n\nMake sure it is running on port 8000."
+        yield history, "❌ Connection failed"
     except Exception as exc:
-        answer = f"❌ **Error:** {exc}\n\n*Make sure the FastAPI backend is running.*"
-        meta = f"Error: {exc}"
-
-    history.append([message, answer])
-    return "", history, meta
+        history[-1][1] = f"❌ **Unexpected error:** {exc}"
+        yield history, f"Error: {exc}"
 
 
 def clear_chat() -> tuple:
     return [], []
+
+
+# ── Evaluation Logic ──────────────────────────────────────────────────────────
 
 
 # ── Upload Logic ──────────────────────────────────────────────────────────────
@@ -373,16 +438,22 @@ def build_ui() -> gr.Blocks:
                                 outputs=msg_input,
                             )
 
-                # ── Event handlers ────────────────────────────────────────────
+                # ── Event handlers (streaming) ────────────────────────────────
                 send_btn.click(
-                    fn=chat_respond,
+                    fn=chat_stream,
                     inputs=[msg_input, chatbot, pipeline_sel],
-                    outputs=[msg_input, chatbot, meta_box],
+                    outputs=[chatbot, meta_box],
+                ).then(
+                    fn=lambda: "",
+                    outputs=[msg_input],
                 )
                 msg_input.submit(
-                    fn=chat_respond,
+                    fn=chat_stream,
                     inputs=[msg_input, chatbot, pipeline_sel],
-                    outputs=[msg_input, chatbot, meta_box],
+                    outputs=[chatbot, meta_box],
+                ).then(
+                    fn=lambda: "",
+                    outputs=[msg_input],
                 )
                 clear_btn.click(
                     fn=clear_chat,
