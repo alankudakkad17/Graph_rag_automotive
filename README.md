@@ -1,4 +1,4 @@
-# 🚗 Automotive Graph RAG System — BMW Edition
+# 🚗 Automotive Graph RAG System
 
 > **Graph-enhanced Retrieval-Augmented Generation** for the automotive industry
 > Powered by **Neo4j + ChromaDB + LangGraph + Ollama** — 100% free, open-source, runs fully locally.
@@ -49,18 +49,17 @@
 
 ## 🛠 Tech Stack — 100% Free & Open-Source
 
-| Component | Technology | Purpose |
-|---|---|---|
-| **LLM** | Ollama — `llama3` / `mistral` / `gemma2` | Answer generation, query classification |
-| **Embeddings** | `sentence-transformers/all-MiniLM-L6-v2` | Semantic chunk encoding (384-dim) |
-| **Reranker** | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Relevance scoring of retrieved passages |
-| **Graph DB** | Neo4j 5 Community (Docker) | Knowledge graph — nodes, edges, traversal |
-| **Vector DB** | ChromaDB (persistent local) | Semantic similarity search (HNSW) |
-| **Agent Framework** | LangGraph | 10-node stateful agent pipeline |
-| **Backend** | FastAPI + Uvicorn | REST API + SSE streaming |
-| **Frontend** | Gradio 4 | Streaming chat UI + graph visualization |
-| **Entity Extraction** | spaCy + regex (automotive rules) | BMW NER for graph population |
-| **Evaluation** | RAGAS (offline script) | Faithfulness, relevancy, precision, recall |
+| Component | Technology |
+|-----------|-----------|
+| **LLM** | [Ollama](https://ollama.com) — `llama3`, `mistral`, `gemma2` |
+| **Embeddings** | `sentence-transformers/all-MiniLM-L6-v2` (local) |
+| **Reranker** | `cross-encoder/ms-marco-MiniLM-L-6-v2` (local) |
+| **Graph DB** | Neo4j 5 Community Edition (Docker) |
+| **Vector DB** | ChromaDB (persistent local) |
+| **Agent Framework** | LangGraph |
+| **Backend** | FastAPI + Uvicorn |
+| **Frontend** | Gradio 4 |
+| **Entity Extraction** | spaCy + regex (automotive domain rules) |
 
 ---
 
@@ -171,26 +170,29 @@ cp ~/Downloads/2023-bmw-7-30-62.pdf data/pdfs/
 ### Step 8 — Ingest the PDF (Run Once)
 
 ```bash
-python ingest_bmw.py
+# Copy your PDF to the data folder
+copy "C:\Users\91956\Downloads\2023-bmw-7-30-62.pdf" data\pdfs\
 
-# Custom path
-python ingest_bmw.py --pdf "data/pdfs/2023-bmw-7-30-62.pdf"
+# Run ingestion
+python -c "
+from backend.pipeline.ingestion_pipeline import IngestionPipeline
+result = IngestionPipeline().run('data/pdfs/2023-bmw-7-30-62.pdf')
+print(result)
+"
 ```
 
-Expected output:
-```
-✅ Ingestion complete!
-   File   : 2023-bmw-7-30-62.pdf
-   Pages  : 13
-   Chunks : 72
-   Doc ID : abc123def456
+### 6. Start the Backend
 
-🚀 Now run: python start.py
+```bash
+# From project root
+python -m backend.main
+# OR
+uvicorn backend.main:app --reload --port 8000
 ```
 
----
+API Docs → http://localhost:8000/docs
 
-### Step 9 — Start the Application
+### 7. Start the Gradio Frontend
 
 ```bash
 python start.py
