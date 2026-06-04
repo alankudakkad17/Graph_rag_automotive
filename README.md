@@ -1,4 +1,4 @@
-# 🚗 Automotive Graph RAG System
+# 🚗 Automotive Hybrid RAG System
 
 > **Graph-enhanced Retrieval-Augmented Generation** for the automotive industry
 > Powered by **Neo4j + ChromaDB + LangGraph + Ollama**
